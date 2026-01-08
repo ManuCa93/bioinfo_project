@@ -1,29 +1,70 @@
 ---
-title: "project"
+title: "Bioinformatics Project - Bulk RNA-seq"
+author: "Bidiscombe, Carnevale, Cattoni"
+date: "`r Sys.Date()`"
 output: html_document
-date: "2026-01-08"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Installare (una volta sola) recount3 se non è presente
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (!requireNamespace("recount3", quietly = TRUE)) {
+  BiocManager::install("recount3")
+}
+
+library(recount3)
+library(SummarizedExperiment)
+
+# 1) Lista dei progetti disponibili in recount3
+projects <- available_projects()
+
+# 2) Filtra i progetti TCGA (The Cancer Genome Atlas)
+tcga_projects <- subset(projects, file_source == "tcga")
+
+# 3) Seleziona il progetto LUAD (Lung Adenocarcinoma)
+projinfo_luad <- subset(tcga_projects, project == "LUAD")
+projinfo_luad
+
+
+# 4) Scarica l'oggetto SummarizedExperiment con i conteggi (genes x samples)
+rse_gene <- create_rse(projinfo_luad)
+
+# 5) Estrai matrice di conteggi e metadata dei campioni
+counts  <- assay(rse_gene, "raw_counts")   # matrice di conteggi grezzi
+coldata <- colData(rse_gene)           # metadata (info sui campioni)
+
+dim(counts)              # numero di geni x numero di campioni
+colnames(counts)[1:5]    # primi 5 campioni
+# 6) Usiamo solo due tipi di campioni: Primary Tumor vs Solid Tissue Normal
+
+sample_type <- coldata$tcga.gdc_cases.samples.sample_type
+table(sample_type)  # conteggio dei tipi di campione disponibili
+# 7) Filtra per tenere solo Tumor e Normal
+keep <- sample_type %in% c("Primary Tumor", "Solid Tissue Normal")
+rse_gene_sub <- rse_gene[, keep]
+
+counts_sub  <- assay(rse_gene_sub, "raw_counts")           # conteggi filtrati
+coldata_sub <- as.data.frame(colData(rse_gene_sub))    # metadata filtrati
+
+dim(counts_sub)
+table(coldata_sub$tcga.gdc_cases.samples.sample_type)
+# 8) Crea una variabile 'condition' = normal / tumor
+
+condition <- ifelse(
+  coldata_sub$tcga.gdc_cases.samples.sample_type == "Primary Tumor",
+  "tumor",
+  "normal"
+)
+
+coldata_sub$condition <- factor(condition, levels = c("normal", "tumor"))
+
+# Controllo finale
+table(coldata_sub$condition)
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
-```
-
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
