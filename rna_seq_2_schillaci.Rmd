@@ -1,0 +1,763 @@
+---
+---
+---
+
+# Overview
+
+-   Reading in table of counts
+-   Filtering lowly expressed genes
+-   Quality control
+-   Normalisation for composition bias
+
+# Install packages
+
+```{r}
+install.packages("BiocManager", repos = "https://cran.r-project.org")
+install.packages("IRdisplay")
+install.packages("curl")
+install.packages("httr")
+install.packages("UpSetR")
+
+
+BiocManager::install(version = "3.22")
+
+BiocManager::install("KEGGREST")
+BiocManager::install("AnnotationDbi")
+BiocManager::install("genefilter")
+BiocManager::install("annotate")
+BiocManager::install("geneplotter")
+BiocManager::install("GEOquery")
+BiocManager::install("edgeR")
+BiocManager::install("ggplot2")
+BiocManager::install("enrichplot")
+BiocManager::install("limma")
+BiocManager::install("DESeq2")
+BiocManager::install("Glimma")
+BiocManager::install("gplots")
+BiocManager::install("org.Mm.eg.db")
+BiocManager::install("RColorBrewer")
+BiocManager::install(c("clusterProfiler", "fgsea", "DOSE", "enrichplot"))
+
+update.packages(ask = FALSE, checkBuilt = TRUE)
+
+
+
+```
+
+# Load libraries
+
+```{r}
+library(DESeq2)
+library(GEOquery)
+library(edgeR)
+library(limma)
+library(Glimma)
+library(ggplot2)
+library(gplots)
+library(IRdisplay)
+library(org.Mm.eg.db)
+library(RColorBrewer)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(UpSetR)
+
+```
+
+This study examines the expression profiles of basal stem-cell enriched cells (B) and committed luminal cells (L) in the mammary gland of virgin, pregnant and lactating mice. Six groups are present, with one for each combination of cell type and mouse status. Each group contains two biological replicates.
+
+```{r}
+# Read the sample information into R
+sampleinfo <- read.delim("./data/SampleInfo_Corrected.txt")
+
+sampleinfo$Replicate <- ave(seq_along(sampleinfo$CellType), 
+                            paste(sampleinfo$CellType, sampleinfo$Status), 
+                            FUN = function(x) seq_along(x))
+sampleinfo
+```
+
+# Load sequence read data
+
+```{r}
+seqdata <- read.delim("./data/GSE60450_Lactation-GenewiseCounts.txt", stringsAsFactors = FALSE)
+head(seqdata)
+dim(seqdata)
+```
+
+The seqdata object contains information about genes (one gene per row), the first column has the Entrez gene id, the second has the gene length and the remaining columns contain information about the number of reads aligning to the gene in each experimental sample. There are two replicates for each cell type and timepoint (detailed sample info can be found in file “GSE60450_series_matrix.txt” )
+
+# Parse the data
+
+```{r parse-data}
+# Remove first two columns from seqdata
+countdata <- seqdata[,-(1:2)]
+
+# Store EntrezGeneID as rownames
+rownames(countdata) <- seqdata[,1]
+
+head(countdata)
+dim(countdata)
+```
+
+```{r sample-names}
+# Parse the sample names by keeping the first 7 characters
+colnames(countdata) <- substr(colnames(countdata), 1, 7)
+head(countdata)
+```
+
+# Parse the data
+
+Here we will perform some data wrangling to obtain a more readable dataset to have $n \times m$ where n is the number of genes and m are the samples.
+
+```{r readable-names}
+# Create new sample names in the format "CellType_Status"
+new_names <- paste(sampleinfo$CellType, sampleinfo$Status, sampleinfo$Replicate, sep = "_")
+
+# Assign these names to the columns of countdata
+colnames(countdata) <- new_names
+head(countdata)
+```
+
+# Normalization for library size
+
+### Counts Per Million (CPM)
+
+For a given gene *i* in sample *j*, the CPM is calculated as:
+
+$$
+\text{CPM}_{ij} = \left( \frac{\text{Raw count}_{ij}}{\sum_{k=1}^{N} \text{Raw count}_{kj}} \right) \times 10^6
+$$
+
+Where:
+
+-   $\text{Raw count}_{ij}$: number of reads for gene *i* in sample *j*\
+-   ${\sum_{k=1}^{N} \text{Raw count}_{kj}}$: total number of reads for all genes in sample *j*\
+-   The multiplication by \$ 10\^6 \$ scales the expression to "per million" units
+
+```{r cpm-filter}
+# Obtain CPMs
+CPMs <- cpm(countdata)
+# Have a look at the output
+head(CPMs)
+```
+
+# Filtering lowly expressed genes
+
+Genes with very low counts across all libraries provide little evidence for differential expression and they interfere with some of the statistical approximations that are used later in the pipeline. They also add to the multiple testing burden when estimating false discovery rates, reducing power to detect differentially expressed genes. These genes should be filtered out prior to further analysis.
+
+There are a few ways to filter out lowly expressed genes. When there are biological replicates in each group, in this case we have a sample size of 2 in each group, we favour filtering on a minimum counts per million threshold present in at least 2 samples. Two represents the smallest sample size for each group in our experiment. In this dataset, we choose to retain genes if they are expressed at a counts-per-million (CPM) above 0.5 in at least two samples.
+
+We' ll use the cpm function from the edgeR library (M D Robinson, McCarthy, and Smyth 2010) to generate the CPM values and then filter. Note that by converting to CPMs we are normalising for the different sequencing depths for each sample.
+
+```{r cpm-thresh}
+# Which values in myCPM are greater than 0.5?
+thresh <- CPMs > 0.5
+# This produces a logical matrix with TRUEs and FALSEs
+head(thresh)
+```
+
+```{r cpm-keep}
+# Summary of how many TRUEs there are in each row
+table(rowSums(thresh))
+
+# This filter removes genes that are only detected in one sample or not detected at all, ensuring that only genes with evidence of expression in multiple samples are kept for further analysis
+keep <- rowSums(thresh) >= 2
+# Subset the rows of countdata to keep the more highly expressed genes
+counts.keep <- countdata[keep,]
+dim(counts.keep)
+```
+
+```{r}
+head(countdata)
+```
+
+As a general rule, a good threshold can be chosen by identifying the CPM that corresponds to a count of 10, which in this case is about 0.5. You should filter with CPMs rather than filtering on the counts directly, as the latter does not account for differences in library sizes between samples.
+
+Another way in doing so is using the built in function `filterByExpr()` of the edgeR package, however to do so we would need more information such as the design of the study and the division in groups because the function is testing if a gene wil be statistically significant in function of the experiment setup.
+
+```{r cpm-plot}
+# Let's have a look and see whether our threshold of 0.5 does indeed correspond to a count of about 10-15 by Plotting the expression profile of the first sample (First column)
+plot(CPMs[,1],countdata[,1],ylim=c(0,20),xlim=c(0,2))
+abline(v=0.5)
+```
+
+### Challenge
+
+1.  Plot the counts-per-million versus counts for the second sample.
+2.  Add a vertical line at 0.5 and a horizontal line at 10.
+3.  Add the lines again, colouring them blue.
+4.  Calculate the TPMs and filter them for \> 1 in at least 2 samples.
+
+For a given gene *i* in sample *j*, the TPM is calculated as:
+
+$$
+\text{TPM}_{ij} = \frac{\frac{\text{Raw count}_{ij}}{\text{Gene length}_i}}{\sum_{k=1}^{N} \frac{\text{Raw count}_{kj}}{\text{Gene length}_k}} \times 10^6
+$$
+
+Where: - $\text{Raw count}_{ij}$ is the number of reads for gene *i* in sample *j*. - $\text{Gene length}_i$ is the length of gene *i* in **kilobases**. - The denominator sums the reads per kilobase for all genes in sample *j*. - The result is scaled to **Transcripts Per Million** by multiplying by $10^6$.
+
+5.  Plot TPMs vs counts, explain why they're not proportional and how to make them proportional.
+
+```{r challenge}
+# Plot CPM vs counts for the second sample
+
+plot(CPMs[,2], countdata[,2], ylim = c(0, 20), xlim = c(0, 2))
+
+# Creaste a function to Calculate TPMs
+
+calculate_TPM <- function(counts, gene_lengths_kb) {
+
+    rpk <- counts / (gene_lengths_kb / 1000)
+
+    rpk_sums <- colSums(rpk)
+
+    tpm <- t(t(rpk) / rpk_sums) * 1e6
+
+    return(tpm)
+}
+
+gene_lengths <- seqdata[, 2]
+TPMs_all <- calculate_TPM(countdata, gene_lengths)
+
+
+# Which values in TPM are greater than 1?
+
+thresh_tpm <- TPMs_all > 1
+
+
+# Keep genes that have at least 2 TRUES in each row of thresh
+
+keep_tpm <- rowSums(thresh_tpm) >= 2
+counts.keep.tpm <- countdata[keep_tpm,]
+dim(counts.keep.tpm)
+TPMs_keep <- TPMs_all[keep_tpm,] 
+
+# Plot TPMs vs counts
+
+plot(TPMs_keep[,2], counts.keep.tpm[,2])
+
+# How we could plot TPMs vs countdata in order to obtain a linear correlation?
+
+rpk_sample2 <- counts.keep.tpm[,2] / (gene_lengths[keep_tpm] / 1000)
+plot(rpk_sample2, counts.keep.tpm[,2])
+
+
+```
+
+# Explorative data analysis
+
+Now that we have got rid of the lowly expressed genes and have our counts stored in a DGEList object, this object is not normalized in cpm or tpm but the library allows us to perform different analysis on the counts such as differential expression and normalization for composition bias.
+
+```{r}
+dgeObj <- DGEList(counts.keep)
+# Here we can see there are different fields such as the experimental group (Default 1), the total number of reads (library size) and the normalization factors that are set to 1 for default.
+dgeObj$samples
+```
+
+## Count the reads for any sample
+
+Here we visualize the library size for every sample
+
+```{r}
+# The names argument tells the barplot to use the sample names on the x-axis
+# The las argument rotates the axis names
+par(mar = c(10, 4, 4, 2))
+barplot(dgeObj$samples$lib.size, names=colnames(dgeObj), las=2)
+# Add a title to the plot
+title("Barplot of library sizes")
+```
+
+## Plot the distribution of expression for sample
+
+```{r}
+par(mgp=c(5,1,0))
+par(mar = c(10, 10, 4, 4))
+boxplot(CPMs, xlab="", ylab="Counts per million",las=2)
+title("Boxplots of CPMs (unnormalised)")
+```
+
+Because raw read counts are not normally distributed, we first log-transform them to better examine their distributions. We can assess these distributions using boxplots of the log2-scaled counts. To do this, we use the cpm function, which computes log2 counts per million while adjusting for differences in library size.
+
+```{r}
+par(mar = c(10, 4, 4, 2))
+# Get log2 counts per million
+logcounts <- cpm(dgeObj,log=TRUE)
+# Check distributions of samples using boxplots
+boxplot(logcounts, xlab="", ylab="Log2 counts per million",las=2)
+# Let's add a blue horizontal line that corresponds to the median logCPM
+abline(h=median(logcounts),col="blue")
+title("Boxplots of logCPMs")
+```
+
+From the boxplots we see that overall the density distributions of raw log-intensities are not identical but still not very different. If a sample is really far above or below the blue horizontal line we may need to investigate that sample further.
+
+# Dimensionality Reduction
+
+By far, one of the most important plots we make when we analyse RNA-Seq data are MDSplots. An MDSplot is a visualisation of a principle components analysis, which determines the greatest sources of variation in the data.
+
+```{r}
+plotMDS(dgeObj)
+```
+
+```{r}
+# Increase the size of the plot in a Jupyter notebook
+options(repr.plot.width=18, repr.plot.height=10)  # Width in inches, height in inches
+
+# Generate the MDS plots (same code as before)
+par(mfrow=c(1,2))
+
+# Convert to factor if not already
+sampleinfo$CellType <- as.factor(sampleinfo$CellType)
+
+# Map colors to the levels of CellType
+col.cell <- c("purple", "orange")[as.factor(sampleinfo$CellType)]
+
+# Redo the MDS with CellType colouring
+plotMDS(dgeObj, col=col.cell, main="Cell type")
+legend("topleft", fill=c("purple", "orange"), legend=levels(sampleinfo$CellType), cex=0.8)
+
+# Similarly for Status
+sampleinfo$Status <- as.factor(sampleinfo$Status)  # Ensure Status is a factor
+col.status <- c("blue", "red", "dark green")[as.factor(sampleinfo$Status)]
+plotMDS(dgeObj, col=col.status, main="Status")
+legend("topleft", fill=c("blue", "red", "dark green"), legend=levels(sampleinfo$Status), cex=0.8)
+```
+
+## Generate interactive plot with Glimma
+
+```{r}
+labels <- paste(sampleinfo$SampleName, sampleinfo$CellType, sampleinfo$Status)
+group <- paste(sampleinfo$CellType,sampleinfo$Status,sep=".")
+group <- factor(group)
+glMDSPlot(dgeObj, labels=labels, groups=group, folder="mds",launch = FALSE)
+```
+
+# Heatmap of most variable genes
+
+```{r}
+# We estimate the variance for each row in the logcounts matrix
+var_genes <- apply(logcounts, 1, var)
+
+# Get the gene names for the top 500 most variable genes
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:500]
+
+# Keep the expression values for the top 500 variable genes
+highly_variable_lcpm <- logcounts[select_var,]
+dim(highly_variable_lcpm)
+
+# Setup colors
+mypalette <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypalette)
+
+# Assign purple and orange to different cell types
+col.cell <- c("purple","orange")[sampleinfo$CellType]
+
+
+heatmap.2(highly_variable_lcpm, 
+          col=rev(morecols(50)),
+          trace="column", 
+          main="Top 500 most variable genes across samples",
+          ColSideColors=col.cell,
+          scale="row",
+          srtCol=20      # Rotate column labels 45 degrees
+)
+```
+
+1.  **Color Scale**:
+    -   The color bar represents the range of values in the heatmap (Z-scores or normalized expression values). Where a red means more expressed and blue less expressed.
+2.  **Histogram**:
+    -   The histogram shows the distribution of the values in the heatmap.
+    -   It indicates how frequently each value (or range of values) occurs across the dataset.
+3.  **Purpose**:
+    -   This plot helps you understand the mapping between the data values and the colors in the heatmap.
+    -   For example, it shows whether the data is centered around zero (e.g., for Z-scores) or skewed.
+
+### Challenge: Redo the heatmap using the top 500 LEAST variable genes.
+
+```{r}
+
+select_least_var <- names(sort(var_genes, decreasing=FALSE))[1:500]
+
+least_variable_lcpm <- logcounts[select_least_var,]
+dim(least_variable_lcpm)
+
+mypalette <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypalette)
+
+col.cell <- c("purple","orange")[sampleinfo$CellType]
+
+heatmap.2(least_variable_lcpm,
+          col=rev(morecols(50)),
+          trace="column",
+          ColSideColors=col.cell,
+          scale="row", 
+          srtCol=20   
+)
+
+
+```
+
+# Normalisation for composition bias
+
+-   Composition bias occurs when a few highly expressed genes dominate the library, skewing the distribution.
+-   Normalization factors close to 1 indicate minimal correction is needed.
+-   TMM (Trimmed Mean of M-values) is the default method in `edgeR`.
+
+```{r}
+# Apply normalisation to DGEList object}
+
+dgeObj <- calcNormFactors(dgeObj) 
+dgeObj$samples
+```
+
+# Differential Expression - Naive Approach
+
+Here we will apply a simple approach in which we are checking the DEGs between luminal and basal. We will directly test the differences by applying a simple t-test on the mean fold changes of the groups
+
+```{r}
+# Save the normalized data into a new variable
+simple_deg <-dgeObj$counts
+head(simple_deg)
+```
+
+## Gather the columns corresponding to the 2 groups
+
+```{r}
+
+luminal_cols <- grep("luminal", colnames(simple_deg))
+basal_cols <- grep("basal",colnames(simple_deg))
+luminal_cols
+```
+
+## Perform a t-test on the groups and obtain the p_value
+
+```{r}
+# Perform t-test for each gene
+p_values <- apply(simple_deg, 1, function(x) {
+  t.test(x[luminal_cols], x[basal_cols])$p.value
+})
+```
+
+## Calculate foldchange
+
+```{r}
+# Compute fold change (mean ratio)
+fold_change <- rowMeans(simple_deg[, luminal_cols]) / 
+               rowMeans(simple_deg[, basal_cols])
+
+# Compute log2 fold change
+log2FC <- log2(rowMeans(simple_deg[, luminal_cols]) / 
+               rowMeans(simple_deg[, basal_cols]))
+```
+
+## Store the data in a "results" dataframe
+
+```{r}
+
+# Combine results
+results_ttest <- data.frame(
+  gene = rownames(simple_deg),
+  log2FC = log2FC,
+  p_value = p_values
+)
+
+results_ttest
+```
+
+## Adjust the pvalue
+
+```{r}
+# Adjust p-values for multiple testing
+results_ttest$adj_p <- p.adjust(results_ttest$p_value, method = "BH")
+results_ttest
+```
+
+## Plot the results
+
+```{r}
+# Add a column for significance (optional)
+results_ttest$significant <- with(results_ttest, ifelse(adj_p < 0.01 & abs(log2FC) > 1, "Significant", "Non Significant"))
+
+# Basic volcano plot
+ggplot(results_ttest, aes(x = log2FC, y = -log10(p_value), color = significant)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Non Significant" = "grey", "Significant" = "red")) +
+  theme_minimal() +
+  xlab("log2 Fold Change") +
+  ylab("-log10 P-value") +
+  ggtitle("Volcano Plot") +
+  theme(legend.title = element_blank())
+```
+
+# Differential Expression with EdgeR
+
+In the previous experimental set up there was a number of problems:
+
+-   Standard **t-tests assume all samples in a group are homogeneous and independent**.\\
+
+-   Here, the **state (virgin/lactate/pregnant)** introduces **additional variability** (a “batch” or “condition” effect).
+
+In edgeR we can model more complex experiments through linear models
+
+-   Create a Design Matrix for the experiment set up
+-   Estimate dispersion
+-   Fit NB generalized linear models (GLMs) for every gene
+
+## Create a Design Matrix
+
+In R, the **design matrix** is a mathematical representation of the experimental setup used in statistical modeling, particularly in RNA-Seq differential expression analysis.
+
+The design matrix is a table (or matrix) where: - **Rows** represent samples. - **Columns** represent experimental conditions or covariates (e.g., group, treatment, batch).
+
+Each cell in the matrix indicates whether a sample belongs to a specific condition or the value of a covariate for that sample. The code will return k-1 columns where k is the number of classes.
+
+------------------------------------------------------------------------
+
+```{r}
+# Retrieve the conditions in our dataset i.e. celltype and status of the samples
+group <- paste(sampleinfo$CellType,sampleinfo$Status,sep=".")
+group
+
+```
+
+```{r}
+# Create the two variables
+group <- as.character(group)
+type <- sapply(strsplit(group, ".", fixed=TRUE), function(x) x[1])
+status <- sapply(strsplit(group, ".", fixed=TRUE), function(x) x[2])
+type
+```
+
+```{r}
+# Specify a design matrix with an intercept term, in this case we are telling the model a design in which we want to test
+design <- model.matrix(~ type + status)
+design
+```
+
+The symbol \~ is read as: “is modeled as a function of”, thus we are modelling the expression as a linear combination of cellular type and status.
+
+In this design, status lactate and cellular type basal are used as refernce in fact there is no column corresponding to either of those being the information encoded in the other columns. Imagine the column would be present, they would be always 0 thus, for example to indicate basal is sufficient set to 0 the type luminal coefficient. Thus we can consider statuspregnant as statuspregnant - lactate (0) and statusvirgin the same.
+
+# Dispersion estimation
+
+The three dispersion estimation steps in edgeR are necessary because RNA-Seq data exhibits overdispersion, meaning that the variability in gene expression is greater than what would be expected under a simple Poisson model. These steps refine the dispersion estimates to account for biological variability and improve the accuracy of differential expression analysis.
+
+By estimating the dispersion, you can distinguish between random noise and true biological signals.
+
+```{r}
+dgeObj <- estimateCommonDisp(dgeObj)
+dgeObj <- estimateGLMTrendedDisp(dgeObj)
+```
+
+# GLM fitting
+
+```{r}
+fit <- glmFit(dgeObj, design) 
+names(fit) 
+head(coef(fit))
+```
+
+Here for every gene a linear model will be fitted depending on the design matrix
+
+$$
+\hat{\mu}_{\text{geneX}} = \hat{\beta}_0 + \hat{\beta}_1 \cdot \text{type}_{\text{luminal}} + \hat{\beta}_2 \cdot \text{status}_{\text{pregnant}} + \hat{\beta}_3 \cdot \text{status}_{\text{virgin}}
+$$
+
+These fitted models are then used for statistical testing (e.g., likelihood ratio tests) to identify differentially expressed genes.
+
+# Likelihood Ratio Test
+
+For each gene, the count data is modeled using a negative binomial GLM:
+
+$$ Y_{gi} \sim \text{NB}(\mu_{gi}, \phi_g) $$
+
+where $Y_{gi}$ is the count for gene $g$ in sample $i$, $\mu_{gi} = \exp(X_i \cdot \beta_g)$ is the expected count of $g$ in sample $i$ given the row in the design matrix $X_{i}$ and coefficients $\beta_{g}$ for gene $g$, and $\phi_{g}$ is the dispersion.
+
+The full model includes the variable(s) of interest while for our experimental settings typeluminal is set to 0 to check wether there are some differences in the 2 groups (luminal and basal).
+
+**P-value (Likelihood Ratio Test)** The likelihood ratio test statistic for each gene is:
+
+$$ LRT_g = 2 \left[ \log L(\text{full model}) - \log L(\text{null model}) \right] $$
+
+Where $\log L(\text{full model})$ is an estimation of how well the model fits with the variable of interest (in this case luminal status) and $\log L(\text{null model})$ is how well a model without the variable fits the data. Thus the **likelihood function** measures **how well a statistical model explains the observed data**.
+
+Finally the pvalue is calculating as $p = P(χ²_{df} ≥ LRT_g)$ in fact under $H_{0}$ (the null model is as good as the full model) $LRT_{g} \sim \chi^2$ distribution.
+
+------------------------------------------------------------------------
+
+```{r}
+lrt.BvsL <- glmLRT(fit,
+                   coef = 2
+                   )
+topTags(lrt.BvsL)
+```
+
+### Differential Expression Analysis: Luminal vs Non-Luminal
+
+Here we are testing whether there is a significant difference in gene expression between two conditions:
+
+-   **Luminal (typeluminal = 1)** vs. **Non-Luminal (typeluminal = 0)**.
+
+The coefficient `coef=2` corresponds to the effect of `typeluminal` in the design matrix. The **likelihood ratio test** (LRT) compares these conditions while controlling for other factors (`statuspregnant`, `statusvirgin`).
+
+#### Interpretation of Results:
+
+-   **Positive logFC**: Genes are **more expressed** in the **luminal** condition.
+-   **Negative logFC**: Genes are **less expressed** in the **luminal** condition.
+
+Use `topTags(lrt.BvsL)` to extract the most significantly differentially expressed genes based on the test.
+
+# Retrieve Gene Names
+
+Now we will add gene names from org.Mm.eg.db package. This package is one of several organism-level packages which are re-built every 6 months. These packages are listed on the annotation section of the Bioconductor.
+
+```{r}
+# Assuming results contains ENTREZ IDs as rownames
+results <- as.data.frame(topTags(lrt.BvsL, n = Inf))
+
+
+
+# Map ENTREZ IDs to SYMBOL and GENENAME
+results$SYMBOL <- mapIds(org.Mm.eg.db,
+                         keys = rownames(results),
+                         column = "SYMBOL",
+                         keytype = "ENTREZID",
+                         multiVals = "first")
+
+results$GENENAME <- mapIds(org.Mm.eg.db,
+                           keys = rownames(results),
+                           column = "GENENAME",
+                           keytype = "ENTREZID",
+                           multiVals = "first")
+
+
+
+# Check the first few rows of the annotated results
+head(results)
+```
+
+## Challenge Visualize the results with a volcano plot on the result we obtain with edgeR
+
+```{r}
+
+results_edger <- as.data.frame(topTags(lrt.BvsL, n = Inf))
+results_edger$adj_p <- results_edger$FDR # FDR is the adjusted p-value
+
+results_edger$significant <- with(results_edger, ifelse(adj_p < 0.01 & abs(logFC) > 1, "Significant", "Non Significant"))
+
+ggplot(results_edger, aes(x = logFC, y = -log10(PValue), color = significant)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Non Significant" = "grey", "Significant" = "red")) +
+  theme_minimal() +
+  xlab("log2 Fold Change") +
+  ylab("-log10 P-value") +
+  ggtitle("Volcano Plot (EdgeR - Luminal vs Basal)") +
+  theme(legend.title = element_blank())
+
+```
+
+## Find the gene symbols of the genes tested
+
+```{r}
+
+
+# Map Entrez IDs to gene names (SYMBOL and GENENAME)
+gene_annotations <- AnnotationDbi::select(org.Mm.eg.db, 
+                                          keys = rownames(dgeObj), 
+                                          columns = c("SYMBOL", "GENENAME"), 
+                                          keytype = "ENTREZID")
+
+# View the result
+head(gene_annotations)
+```
+
+## Challenge: Find the overlapping set (either using upsetplot or venn diagram) of the more expressed genes from the 2 methods, is there consistency ?
+
+As threshold you can select 2 fold and significant with a pvalue \< 0.01
+
+```{r}
+
+ttest_upregulated <- results_ttest[results_ttest$log2FC > 1 & results_ttest$adj_p < 0.01, ]
+ttest_gene_ids <- ttest_upregulated$gene
+
+edger_upregulated <- results_edger[results_edger$logFC > 1 & results_edger$FDR < 0.01, ]
+edger_gene_ids <- rownames(edger_upregulated)
+
+
+list_of_genes <- list(
+  "Naive T-Test" = ttest_gene_ids,
+  "EdgeR GLM" = edger_gene_ids
+)
+
+overlapping_genes <- intersect(ttest_gene_ids, edger_gene_ids)
+n_ttest <- length(ttest_gene_ids)
+n_edger <- length(edger_gene_ids)
+n_overlap <- length(overlapping_genes)
+
+
+upset(fromList(list_of_genes), order.by = "freq")
+
+```
+
+# Function enrichment analysis on the upregulated genes we obtain through edgeR
+
+```{r}
+
+upregulated_edgeR <- rownames(results_edger[results_edger$logFC > 1 & results_edger$FDR < 0.01, ])
+
+ego <- enrichGO(gene          = upregulated_edgeR,
+                OrgDb         = org.Mm.eg.db, 
+                ont           = "BP",      
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.2,
+                readable      = TRUE) 
+
+
+dotplot(ego, showCategory=10)    
+```
+
+## Visualize same results with the network
+
+```{r}
+ora_analysis_bp <- pairwise_termsim(ego, method = "JC")
+emapplot(ora_analysis_bp, color = "qvalue")
+```
+
+idk where pairwise_termsim comes from
+
+# Further tests
+
+with our design setup we could perform other tests, for this the `makeContrasts()` function will be useful allowing to define the specific comparisons we want to test between experimental groups. Each contrast represents a hypothesis about differences in expression, expressed as a linear combination of the model’s coefficients.
+
+For example, since lactate is our baseline in the design matrix, simple group differences—such as *pregnant vs lactate*-can be tested by selecting the appropriate coefficient, e.g. `makeContrasts(statuspregnant, levels = design)`.
+
+More complex comparisons, like *pregnant vs virgin*, have to be expressed explicitly, for instance `makeContrasts(statuspregnant - statusvirgin, levels = design)`. In fact in our design matrix lactate is the baseline thus we don't have a column that test directly the difference between these two condition.
+
+When an interaction model is used, we can test effects **within** each subgroup, such as *pregnant vs virgin within basal cells*, using a contrast like `makeContrasts('typebasal:statuspregnant + typebasal:statusvirgin', levels = design)`. Here we would need to update the design matrix in fact in our setup `~ type + status)` we assumed the 2 effects to be independent and additive while if we are assuming the 2 effects to be related we can frame the design matrix as `~ type * status)`. Here the interaction term type:status will be added.
+
+## Challenge: test DEGs for another condition
+
+```{r}
+
+group <- paste(sampleinfo$CellType,sampleinfo$Status,sep=".")
+group <- as.factor(group) 
+
+
+design_interaction <- model.matrix(~ 0 + group) 
+colnames(design_interaction) <- levels(group)
+design_interaction
+
+dgeObj <- estimateDisp(dgeObj, design_interaction)
+
+fit_interaction <- glmFit(dgeObj, design_interaction)
+
+
+con <- makeContrasts(basal.pregnant - basal.virgin, levels = design_interaction)
+
+
+lrt.BpregVsBvir <- glmLRT(fit_interaction, contrast = con)
+
+
+print("Top DEGs: Basal (Pregnant vs Virgin)")
+topTags(lrt.BpregVsBvir)
+```
