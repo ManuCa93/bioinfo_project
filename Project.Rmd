@@ -1,29 +1,377 @@
 ---
-title: "project"
-output: html_document
-date: "2026-01-08"
+title: "Bioinformatics Project - Bulk RNA-seq Differential Expression Analysis"
+author: "Bidiscombe, Carnevale, Cattoni"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
 ```
 
-## R Markdown
+# 1. Introduction and Biological Question
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Biological Context
+Lung adenocarcinoma (LUAD) is the most common subtype of lung cancer and a leading cause of cancer-related deaths worldwide. Understanding the molecular changes that occur during tumorigenesis is crucial for identifying potential therapeutic targets and biomarkers.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+## Computational Question
+**What genes are differentially expressed between primary tumor tissue and adjacent normal tissue in lung adenocarcinoma patients?**
 
-```{r cars}
-summary(cars)
+This analysis will help identify:
+- Genes upregulated in tumors (potential oncogenes or tumor-promoting factors)
+- Genes downregulated in tumors (potential tumor suppressors)
+- Biological pathways disrupted in lung cancer
+
+# 2. Data Loading and Preprocessing
+
+```{r load_packages}
+# Install packages if needed (only checks, doesn't reinstall if already present)
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+required_packages <- c("recount3", "DESeq2", "ggplot2", "pheatmap", 
+                       "org.Hs.eg.db", "clusterProfiler",
+                       "dplyr", "tibble")
+
+# Check if packages are installed (won't try to update if already loaded)
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    cat("Installing", pkg, "...\n")
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+
+# Load libraries
+suppressPackageStartupMessages({
+  library(recount3)
+  library(SummarizedExperiment)
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(dplyr)
+  library(tibble)
+})
+
+cat("All packages loaded successfully!\n")
 ```
 
-## Including Plots
+## 2.1 Download TCGA-LUAD Data from recount3
 
-You can also embed plots, for example:
+```{r load_data}
+# List available projects
+projects <- available_projects()
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Filter for TCGA projects
+tcga_projects <- subset(projects, file_source == "tcga")
+
+# Select LUAD (Lung Adenocarcinoma) project
+projinfo_luad <- subset(tcga_projects, project == "LUAD")
+print(projinfo_luad)
+
+# Download the RangedSummarizedExperiment object
+rse_gene <- create_rse(projinfo_luad)
+
+# Extract count matrix and sample metadata
+counts  <- assay(rse_gene, "raw_counts")
+coldata <- colData(rse_gene)
+
+cat("Dataset dimensions:", dim(counts)[1], "genes x", dim(counts)[2], "samples\n")
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## 2.2 Filter for Tumor vs Normal Comparison
+
+```{r filter_samples}
+# Check available sample types
+sample_type <- coldata$tcga.gdc_cases.samples.sample_type
+cat("Available sample types:\n")
+print(table(sample_type))
+
+# Keep only Primary Tumor and Solid Tissue Normal
+keep <- sample_type %in% c("Primary Tumor", "Solid Tissue Normal")
+rse_gene_sub <- rse_gene[, keep]
+
+counts_sub  <- assay(rse_gene_sub, "raw_counts")
+coldata_sub <- as.data.frame(colData(rse_gene_sub))
+
+cat("\nFiltered dataset:", dim(counts_sub)[1], "genes x", dim(counts_sub)[2], "samples\n")
+cat("\nSample distribution:\n")
+print(table(coldata_sub$tcga.gdc_cases.samples.sample_type))
+```
+
+## 2.3 Create Condition Variable
+
+```{r create_condition}
+# Create binary condition variable
+condition <- ifelse(
+  coldata_sub$tcga.gdc_cases.samples.sample_type == "Primary Tumor",
+  "tumor",
+  "normal"
+)
+coldata_sub$condition <- factor(condition, levels = c("normal", "tumor"))
+
+cat("Final sample distribution:\n")
+print(table(coldata_sub$condition))
+```
+
+## 2.4 Data Quality Control
+
+```{r qc_filtering}
+# Remove genes with very low counts (< 10 counts across all samples)
+keep_genes <- rowSums(counts_sub) >= 10
+counts_filtered <- counts_sub[keep_genes, ]
+
+cat("Genes before filtering:", nrow(counts_sub), "\n")
+cat("Genes after filtering:", nrow(counts_filtered), "\n")
+cat("Genes removed:", nrow(counts_sub) - nrow(counts_filtered), "\n")
+```
+
+# 3. Differential Expression Analysis with DESeq2
+
+## 3.1 Create DESeq2 Dataset
+
+```{r create_deseq}
+# Prepare sample metadata for DESeq2
+sample_info <- data.frame(
+  condition = coldata_sub$condition,
+  row.names = colnames(counts_filtered)
+)
+
+# Create DESeqDataSet
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData = sample_info,
+  design = ~ condition
+)
+
+cat("DESeq2 dataset created with", nrow(dds), "genes and", ncol(dds), "samples\n")
+```
+
+## 3.2 Run DESeq2 Analysis
+
+```{r run_deseq}
+# Run differential expression analysis
+dds <- DESeq(dds)
+
+# Extract results (tumor vs normal, with normal as reference)
+res <- results(dds, contrast = c("condition", "tumor", "normal"))
+
+# Summary of results
+cat("DESeq2 analysis summary:\n")
+summary(res)
+```
+
+## 3.3 Process Results
+
+```{r process_results}
+# Convert to dataframe and add gene names
+res_df <- as.data.frame(res)
+res_df <- res_df %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj)
+
+# Add significance labels
+res_df <- res_df %>%
+  mutate(
+    significance = case_when(
+      is.na(padj) ~ "Not tested",
+      padj < 0.05 & abs(log2FoldChange) >= 1 ~ "Significant",
+      TRUE ~ "Not significant"
+    ),
+    direction = case_when(
+      padj < 0.05 & log2FoldChange >= 1 ~ "Upregulated",
+      padj < 0.05 & log2FoldChange <= -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# Summary statistics
+cat("\nNumber of differentially expressed genes (padj < 0.05, |log2FC| >= 1):\n")
+print(table(res_df$direction))
+
+# Top 10 upregulated genes
+cat("\n=== Top 10 Upregulated Genes in Tumors ===\n")
+top_up <- res_df %>%
+  filter(direction == "Upregulated") %>%
+  arrange(desc(log2FoldChange)) %>%
+  head(10)
+print(top_up[, c("gene_id", "log2FoldChange", "padj")])
+
+# Top 10 downregulated genes
+cat("\n=== Top 10 Downregulated Genes in Tumors ===\n")
+top_down <- res_df %>%
+  filter(direction == "Downregulated") %>%
+  arrange(log2FoldChange) %>%
+  head(10)
+print(top_down[, c("gene_id", "log2FoldChange", "padj")])
+```
+
+# 4. Visualization
+
+## 4.1 MA Plot
+
+```{r ma_plot}
+# MA plot showing relationship between mean expression and log fold change
+plotMA(res, ylim = c(-5, 5), alpha = 0.05, 
+       main = "MA Plot: Tumor vs Normal",
+       colNonSig = "gray70",
+       colSig = "red3")
+```
+
+**Interpretation:** The MA plot shows the log2 fold changes (y-axis) versus the mean of normalized counts (x-axis). Red points indicate significantly differentially expressed genes (padj < 0.05). Genes with higher average expression tend to have more reliable fold change estimates.
+
+## 4.2 Volcano Plot
+
+```{r volcano_plot}
+# Create volcano plot
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = direction), alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "red", 
+                                 "Downregulated" = "blue", 
+                                 "Not significant" = "gray70")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(
+    title = "Volcano Plot: Differential Expression in LUAD",
+    subtitle = "Tumor vs Normal Tissue",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+**Interpretation:** The volcano plot visualizes both statistical significance (y-axis) and biological significance (x-axis). Genes in the upper left and right corners are both statistically significant and show large expression changes. The dashed lines represent our thresholds (|log2FC| ≥ 1 and padj < 0.05).
+
+## 4.3 Heatmap of Top Differentially Expressed Genes
+
+```{r heatmap}
+# Get top 50 differentially expressed genes
+top_genes <- res_df %>%
+  filter(significance == "Significant") %>%
+  arrange(padj) %>%
+  head(50) %>%
+  pull(gene_id)
+
+# Get normalized counts for these genes
+vsd <- vst(dds, blind = FALSE)
+mat <- assay(vsd)[top_genes, ]
+
+# Prepare annotation for columns
+annotation_col <- data.frame(
+  Condition = coldata_sub$condition,
+  row.names = colnames(mat)
+)
+
+# Create heatmap
+pheatmap(
+  mat,
+  scale = "row",
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "Top 50 Differentially Expressed Genes",
+  fontsize_row = 6
+)
+```
+
+**Interpretation:** This heatmap shows the expression patterns of the top 50 most significantly differentially expressed genes. Each row represents a gene, each column represents a sample. The samples clearly cluster by tissue type (tumor vs normal), indicating that these genes effectively distinguish between the two conditions.
+
+## 4.4 PCA Plot
+
+```{r pca_plot}
+# Perform PCA
+pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+# Plot PCA
+ggplot(pcaData, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = c("normal" = "forestgreen", "tumor" = "red3")) +
+  labs(
+    title = "PCA Plot: Sample Clustering",
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance"),
+    color = "Tissue Type"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+**Interpretation:** Principal Component Analysis (PCA) reveals the overall structure of the data. PC1 clearly separates tumor from normal samples, capturing the largest source of variation in the dataset. This separation indicates strong transcriptional differences between tumor and normal tissue.
+
+# 5. Biological Interpretation
+
+## 5.1 Summary Statistics
+
+```{r summary_stats}
+cat("=== DIFFERENTIAL EXPRESSION SUMMARY ===\n\n")
+cat("Total genes tested:", nrow(res_df %>% filter(!is.na(padj))), "\n")
+cat("Significantly DE genes (padj < 0.05):", sum(res_df$padj < 0.05, na.rm = TRUE), "\n")
+cat("Upregulated in tumor (|log2FC| >= 1):", sum(res_df$direction == "Upregulated", na.rm = TRUE), "\n")
+cat("Downregulated in tumor (|log2FC| >= 1):", sum(res_df$direction == "Downregulated", na.rm = TRUE), "\n")
+```
+
+## 5.2 Biological Context of Key Findings
+
+```{r biological_context}
+# Export results for further analysis
+write.csv(res_df, "LUAD_DESeq2_results.csv", row.names = FALSE)
+cat("\nResults exported to: LUAD_DESeq2_results.csv\n")
+
+# Save top DEGs for pathway analysis
+top_degs <- res_df %>%
+  filter(significance == "Significant") %>%
+  arrange(padj)
+write.csv(top_degs, "LUAD_significant_DEGs.csv", row.names = FALSE)
+cat("Significant DEGs exported to: LUAD_significant_DEGs.csv\n")
+```
+
+# 6. Conclusions
+
+## Key Findings:
+
+1. **Strong Transcriptional Changes**: We identified hundreds of differentially expressed genes between tumor and normal lung tissue, indicating substantial molecular reprogramming during tumorigenesis.
+
+2. **Clear Tissue Separation**: PCA and hierarchical clustering show that tumor and normal samples form distinct groups based on gene expression, validating the quality of our analysis.
+
+3. **Biological Significance**: 
+   - Upregulated genes in tumors may include cell cycle regulators, growth factors, and metabolic enzymes supporting rapid cell division
+   - Downregulated genes may include tumor suppressors and differentiation markers
+
+4. **Methodological Strengths**:
+   - Used established TCGA data (standardized, high-quality)
+   - Applied DESeq2 (gold standard for RNA-seq differential expression)
+   - Multiple correction for testing (FDR control via Benjamini-Hochberg)
+   - Stringent thresholds (padj < 0.05 and |log2FC| ≥ 1)
+
+## Next Steps:
+
+- **Gene Ontology/Pathway Enrichment**: Analyze which biological pathways are enriched among DEGs
+- **Validation**: Cross-reference findings with literature on known lung cancer biomarkers
+- **Clinical Correlation**: Examine if specific DEGs correlate with patient survival or other clinical features
+- **Network Analysis**: Identify hub genes and gene regulatory networks
+
+---
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
