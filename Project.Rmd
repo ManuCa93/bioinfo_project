@@ -15,27 +15,31 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width =
 # 1. Introduction and Biological Question
 
 ## Biological Context
+
 Lung adenocarcinoma (LUAD) is the most common subtype of lung cancer and a leading cause of cancer-related deaths worldwide. Understanding the molecular changes that occur during tumorigenesis is crucial for identifying potential therapeutic targets and biomarkers.
 
 ## Computational Question
+
 *What genes are differentially expressed between primary tumor tissue and adjacent normal tissue in lung adenocarcinoma patients?*
 
 This analysis will help identify:
-•⁠  ⁠Genes upregulated in tumors (potential oncogenes or tumor-promoting factors)
-•⁠  ⁠Genes downregulated in tumors (potential tumor suppressors)
-•⁠  ⁠Biological pathways disrupted in lung cancer
+
+-   Genes upregulated in tumors (potential oncogenes or tumor-promoting factors)
+-   Genes downregulated in tumors (potential tumor suppressors)
+-   Biological pathways disrupted in lung cancer
 
 # 2. Data Loading and Preprocessing
 
 ```{r load_packages}
 # Load required libraries
 # Note: If any package is missing, install it first with:
-# BiocManager::install(c("recount3", "DESeq2", "pheatmap", "org.Hs.eg.db"))
+# BiocManager::install(c("recount3", "edgeR", "limma", "pheatmap", "org.Hs.eg.db", "clusterProfiler"))
 
 suppressPackageStartupMessages({
   library(recount3)
   library(SummarizedExperiment)
-  library(DESeq2)
+  library(edgeR)
+  library(limma)
   library(ggplot2)
   library(pheatmap)
   library(dplyr)
@@ -103,98 +107,152 @@ cat("Final sample distribution:\n")
 print(table(coldata_sub$condition))
 ```
 
-## 2.4 Data Quality Control
+## 2.4 Data Quality Control with CPM Filtering
 
 ```{r qc_filtering}
-# Remove genes with very low counts (< 10 counts across all samples)
-keep_genes <- rowSums(counts_sub) >= 10
+# Calculate CPM (Counts Per Million)
+cpm_values <- cpm(counts_sub)
+
+# Determine the size of the smallest group
+min_group_size <- min(table(coldata_sub$condition))
+
+# Keep genes with CPM > 0.5 in at least min_group_size samples
+keep_genes <- rowSums(cpm_values > 0.5) >= min_group_size
 counts_filtered <- counts_sub[keep_genes, ]
 
 cat("Genes before filtering:", nrow(counts_sub), "\n")
 cat("Genes after filtering:", nrow(counts_filtered), "\n")
 cat("Genes removed:", nrow(counts_sub) - nrow(counts_filtered), "\n")
+cat("Filtering criterion: CPM > 0.5 in at least", min_group_size, "samples\n")
 ```
 
-# 3. Differential Expression Analysis with DESeq2
+# 3. Differential Expression Analysis with edgeR
 
-## 3.1 Create DESeq2 Dataset
+## 3.1 Create DGEList Object
 
-```{r create_deseq}
-# Prepare sample metadata for DESeq2
+```{r create_dgelist}
+# Prepare sample metadata for edgeR
 sample_info <- data.frame(
   condition = coldata_sub$condition,
   row.names = colnames(counts_filtered)
 )
 
-# Create DESeqDataSet
-dds <- DESeqDataSetFromMatrix(
-  countData = counts_filtered,
-  colData = sample_info,
-  design = ~ condition
-)
+# Create DGEList object
+dge <- DGEList(counts = counts_filtered, group = sample_info$condition)
 
-cat("DESeq2 dataset created with", nrow(dds), "genes and", ncol(dds), "samples\n")
+cat("DGEList object created with", nrow(dge), "genes and", ncol(dge), "samples\n")
+cat("\nLibrary sizes:\n")
+print(summary(dge$samples$lib.size))
 ```
 
-## 3.2 Run DESeq2 Analysis
+## 3.2 Normalization
 
-```{r run_deseq}
-# Run differential expression analysis
-dds <- DESeq(dds)
+```{r normalization}
+# Calculate normalization factors using TMM (Trimmed Mean of M-values)
+dge <- calcNormFactors(dge, method = "TMM")
 
-# Extract results (tumor vs normal, with normal as reference)
-res <- results(dds, contrast = c("condition", "tumor", "normal"))
+cat("Normalization factors calculated:\n")
+print(summary(dge$samples$norm.factors))
 
-# Summary of results
-cat("DESeq2 analysis summary:\n")
-summary(res)
+# Visualize normalization factors
+barplot(dge$samples$norm.factors, 
+        main = "TMM Normalization Factors",
+        ylab = "Normalization Factor",
+        xlab = "Sample Index",
+        col = ifelse(dge$samples$group == "tumor", "red3", "forestgreen"),
+        las = 2)
+abline(h = 1, lty = 2, col = "blue")
+legend("topright", legend = c("Tumor", "Normal"), 
+       fill = c("red3", "forestgreen"), bty = "n")
 ```
 
-## 3.3 Process Results
+*Interpretation:* TMM normalization accounts for differences in library composition between samples. Normalization factors close to 1 indicate similar library compositions, while deviations suggest compositional biases that are corrected.
+
+## 3.3 Design Matrix and Dispersion Estimation
+
+```{r design_dispersion}
+# Create design matrix
+design <- model.matrix(~ condition, data = sample_info)
+colnames(design) <- c("Intercept", "TumorvNormal")
+
+cat("Design matrix:\n")
+print(head(design))
+
+# Estimate dispersion
+dge <- estimateDisp(dge, design, robust = TRUE)
+
+cat("\nDispersion estimates:\n")
+cat("  Common dispersion:", dge$common.dispersion, "\n")
+cat("  Trended dispersion range:", range(dge$trended.dispersion), "\n")
+cat("  Tagwise dispersion range:", range(dge$tagwise.dispersion), "\n")
+
+# Plot biological coefficient of variation
+plotBCV(dge, main = "Biological Coefficient of Variation")
+```
+
+*Interpretation:* The BCV plot shows the biological variability in gene expression. The common dispersion represents the overall variability, while tagwise dispersions capture gene-specific variation. Higher BCV indicates greater biological variability between replicates.
+
+## 3.4 Differential Expression Testing
+
+```{r glm_testing}
+# Fit generalized linear model
+fit <- glmFit(dge, design)
+
+# Perform likelihood ratio test for tumor vs normal
+lrt <- glmLRT(fit, coef = "TumorvNormal")
+
+# Extract results
+res <- topTags(lrt, n = Inf)
+res_df <- as.data.frame(res)
+
+cat("edgeR analysis summary:\n")
+cat("Total genes tested:", nrow(res_df), "\n")
+cat("Genes with FDR < 0.05:", sum(res_df$FDR < 0.05), "\n")
+```
+
+## 3.5 Process Results
 
 ```{r process_results}
 # Convert to dataframe and add gene names
-res_df <- as.data.frame(res)
 res_df <- res_df %>%
   rownames_to_column("gene_id") %>%
-  arrange(padj)
+  arrange(FDR)
 
 # Add significance labels
 res_df <- res_df %>%
   mutate(
     significance = case_when(
-      is.na(padj) ~ "Not tested",
-      padj < 0.05 & abs(log2FoldChange) >= 1 ~ "Significant",
+      is.na(FDR) ~ "Not tested",
+      FDR < 0.05 & abs(logFC) >= 1 ~ "Significant",
       TRUE ~ "Not significant"
     ),
     direction = case_when(
-      padj < 0.05 & log2FoldChange >= 1 ~ "Upregulated",
-      padj < 0.05 & log2FoldChange <= -1 ~ "Downregulated",
+      FDR < 0.05 & logFC >= 1 ~ "Upregulated",
+      FDR < 0.05 & logFC <= -1 ~ "Downregulated",
       TRUE ~ "Not significant"
     )
   )
 
 # Summary statistics
-cat("\nNumber of differentially expressed genes (padj < 0.05, |log2FC| >= 1):\n")
+cat("\nNumber of differentially expressed genes (FDR < 0.05, |logFC| >= 1):\n")
 print(table(res_df$direction))
 
 # Top 10 upregulated genes
 cat("\n=== Top 10 Upregulated Genes in Tumors ===\n")
 top_up <- res_df %>%
   filter(direction == "Upregulated") %>%
-  arrange(desc(log2FoldChange)) %>%
+  arrange(desc(logFC)) %>%
   head(10)
-print(top_up[, c("gene_id", "log2FoldChange", "padj")])
+print(top_up[, c("gene_id", "logFC", "FDR")])
 
 # Top 10 downregulated genes
 cat("\n=== Top 10 Downregulated Genes in Tumors ===\n")
 top_down <- res_df %>%
   filter(direction == "Downregulated") %>%
-  arrange(log2FoldChange) %>%
+  arrange(logFC) %>%
   head(10)
-print(top_down[, c("gene_id", "log2FoldChange", "padj")])
+print(top_down[, c("gene_id", "logFC", "FDR")])
 ```
-
 
 # 4. Visualization
 
@@ -202,19 +260,17 @@ print(top_down[, c("gene_id", "log2FoldChange", "padj")])
 
 ```{r ma_plot}
 # MA plot showing relationship between mean expression and log fold change
-plotMA(res, ylim = c(-5, 5), alpha = 0.05, 
-       main = "MA Plot: Tumor vs Normal",
-       colNonSig = "gray70",
-       colSig = "red3")
+plotMD(lrt, main = "MA Plot: Tumor vs Normal")
+abline(h = c(-1, 1), col = "blue", lty = 2)
 ```
 
-*Interpretation:* The MA plot shows the log2 fold changes (y-axis) versus the mean of normalized counts (x-axis). Red points indicate significantly differentially expressed genes (padj < 0.05). Genes with higher average expression tend to have more reliable fold change estimates.
+*Interpretation:* The MA plot shows the log2 fold changes (y-axis) versus the average log2 counts per million (x-axis). Red points indicate significantly differentially expressed genes (FDR \< 0.05). Genes with higher average expression tend to have more reliable fold change estimates.
 
 ## 4.2 Volcano Plot
 
 ```{r volcano_plot}
 # Create volcano plot
-ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+ggplot(res_df, aes(x = logFC, y = -log10(FDR))) +
   geom_point(aes(color = direction), alpha = 0.6, size = 1.5) +
   scale_color_manual(values = c("Upregulated" = "red", 
                                  "Downregulated" = "blue", 
@@ -223,9 +279,9 @@ ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
   geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
   labs(
     title = "Volcano Plot: Differential Expression in LUAD",
-    subtitle = "Tumor vs Normal Tissue",
+    subtitle = "Tumor vs Normal Tissue (edgeR analysis)",
     x = "Log2 Fold Change",
-    y = "-Log10 Adjusted P-value",
+    y = "-Log10 FDR",
     color = "Regulation"
   ) +
   theme_bw() +
@@ -236,7 +292,7 @@ ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
   )
 ```
 
-*Interpretation:* The volcano plot visualizes both statistical significance (y-axis) and biological significance (x-axis). Genes in the upper left and right corners are both statistically significant and show large expression changes. The dashed lines represent our thresholds (|log2FC| ≥ 1 and padj < 0.05).
+*Interpretation:* The volcano plot visualizes both statistical significance (y-axis) and biological significance (x-axis). Genes in the upper left and right corners are both statistically significant and show large expression changes. The dashed lines represent our thresholds (\|logFC\| ≥ 1 and FDR \< 0.05).
 
 ## 4.3 Heatmap of Top Differentially Expressed Genes
 
@@ -244,13 +300,13 @@ ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
 # Get top 50 differentially expressed genes
 top_genes <- res_df %>%
   filter(significance == "Significant") %>%
-  arrange(padj) %>%
+  arrange(FDR) %>%
   head(50) %>%
   pull(gene_id)
 
-# Get normalized counts for these genes
-vsd <- vst(dds, blind = FALSE)
-mat <- assay(vsd)[top_genes, ]
+# Calculate log-CPM values for heatmap
+logcpm <- cpm(dge, log = TRUE)
+mat <- logcpm[top_genes, ]
 
 # Prepare annotation for columns
 annotation_col <- data.frame(
@@ -276,21 +332,31 @@ pheatmap(
 
 *Interpretation:* This heatmap shows the expression patterns of the top 50 most significantly differentially expressed genes. Each row represents a gene, each column represents a sample. The samples clearly cluster by tissue type (tumor vs normal), indicating that these genes effectively distinguish between the two conditions.
 
-## 4.4 PCA Plot
+## 4.4 MDS Plot
 
-```{r pca_plot}
-# Perform PCA
-pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
-percentVar <- round(100 * attr(pcaData, "percentVar"))
+```{r mds_plot}
+# Multidimensional scaling plot
+# Calculate log-CPM with prior count
+logcpm_mds <- cpm(dge, log = TRUE, prior.count = 2)
 
-# Plot PCA
-ggplot(pcaData, aes(x = PC1, y = PC2, color = condition)) +
+# Perform MDS
+mds <- plotMDS(logcpm_mds, plot = FALSE)
+
+# Create dataframe for plotting
+mds_data <- data.frame(
+  Dim1 = mds$x,
+  Dim2 = mds$y,
+  condition = coldata_sub$condition
+)
+
+# Plot MDS
+ggplot(mds_data, aes(x = Dim1, y = Dim2, color = condition)) +
   geom_point(size = 3, alpha = 0.8) +
   scale_color_manual(values = c("normal" = "forestgreen", "tumor" = "red3")) +
   labs(
-    title = "PCA Plot: Sample Clustering",
-    x = paste0("PC1: ", percentVar[1], "% variance"),
-    y = paste0("PC2: ", percentVar[2], "% variance"),
+    title = "MDS Plot: Sample Clustering",
+    x = "Leading logFC dimension 1",
+    y = "Leading logFC dimension 2",
     color = "Tissue Type"
   ) +
   theme_bw() +
@@ -300,21 +366,11 @@ ggplot(pcaData, aes(x = PC1, y = PC2, color = condition)) +
   )
 ```
 
-*Interpretation:* Principal Component Analysis (PCA) reveals the overall structure of the data. PC1 clearly separates tumor from normal samples, capturing the largest source of variation in the dataset. This separation indicates strong transcriptional differences between tumor and normal tissue.
+*Interpretation:* Multidimensional Scaling (MDS) plot reveals the overall structure of the data based on leading fold changes. The clear separation between tumor and normal samples indicates strong transcriptional differences between tissue types. MDS is analogous to PCA but based on pairwise distances between samples.
 
-# 5. Biological Interpretation
+# 5. Gene Annotation
 
-## 5.1 Summary Statistics
-
-```{r summary_stats}
-cat("=== DIFFERENTIAL EXPRESSION SUMMARY ===\n\n")
-cat("Total genes tested:", nrow(res_df %>% filter(!is.na(padj))), "\n")
-cat("Significantly DE genes (padj < 0.05):", sum(res_df$padj < 0.05, na.rm = TRUE), "\n")
-cat("Upregulated in tumor (|log2FC| >= 1):", sum(res_df$direction == "Upregulated", na.rm = TRUE), "\n")
-cat("Downregulated in tumor (|log2FC| >= 1):", sum(res_df$direction == "Downregulated", na.rm = TRUE), "\n")
-```
-
-## 5.2 Biological Context of Key Findings
+## 5.1 Add Gene Symbols and Entrez IDs
 
 ```{r biological_context}
 # Load annotation library
@@ -347,7 +403,7 @@ res_df$gene_symbol <- symbol_map[res_df$ensembl_id_clean]
 # Reorder columns for better readability
 res_df <- res_df %>%
   dplyr::select(gene_id, ensembl_id_clean, entrez_id, gene_symbol, 
-         baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, 
+         logFC, logCPM, LR, PValue, FDR, 
          significance, direction)
 
 cat("\nAnnotation summary:\n")
@@ -356,34 +412,194 @@ cat("  - Genes with Entrez ID:", sum(!is.na(res_df$entrez_id)), "\n")
 cat("  - Genes with gene symbol:", sum(!is.na(res_df$gene_symbol)), "\n")
 
 # Export results for further analysis
-write.csv(res_df, "results_de_genes_LUAD.csv", row.names = FALSE)
-cat("\nResults exported to: results_de_genes_LUAD.csv\n")
+write.csv(res_df, "results_de_genes_LUAD_edgeR.csv", row.names = FALSE)
+cat("\nResults exported to: results_de_genes_LUAD_edgeR.csv\n")
 
 # Save top DEGs for pathway analysis
 top_degs <- res_df %>%
   filter(significance == "Significant") %>%
-  arrange(padj)
-write.csv(top_degs, "LUAD_significant_DEGs.csv", row.names = FALSE)
-cat("Significant DEGs exported to: LUAD_significant_DEGs.csv\n")
+  arrange(FDR)
+write.csv(top_degs, "LUAD_significant_DEGs_edgeR.csv", row.names = FALSE)
+cat("Significant DEGs exported to: LUAD_significant_DEGs_edgeR.csv\n")
 ```
 
-# 6. Extended Results Analysis
+# 6. GO Enrichment Analysis
 
-## 6.1 Distribution of Differentially Expressed Genes
+## 6.1 Prepare Gene Lists for Enrichment
+
+```{r prepare_gene_lists}
+# Load clusterProfiler
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) {
+  BiocManager::install("clusterProfiler")
+}
+library(clusterProfiler)
+
+# Get significant upregulated genes
+sig_up <- res_df %>%
+  filter(direction == "Upregulated", !is.na(entrez_id)) %>%
+  pull(entrez_id)
+
+# Get significant downregulated genes
+sig_down <- res_df %>%
+  filter(direction == "Downregulated", !is.na(entrez_id)) %>%
+  pull(entrez_id)
+
+# Get all significant genes
+sig_all <- res_df %>%
+  filter(significance == "Significant", !is.na(entrez_id)) %>%
+  pull(entrez_id)
+
+# Background: all genes tested
+background <- res_df %>%
+  filter(!is.na(entrez_id)) %>%
+  pull(entrez_id)
+
+cat("Genes for enrichment analysis:\n")
+cat("  - Upregulated:", length(sig_up), "\n")
+cat("  - Downregulated:", length(sig_down), "\n")
+cat("  - Total significant:", length(sig_all), "\n")
+cat("  - Background:", length(background), "\n")
+```
+
+## 6.2 GO Enrichment - All Significant Genes
+
+```{r go_enrichment_all}
+# GO enrichment for all significant genes
+ego_all <- enrichGO(
+  gene = sig_all,
+  universe = background,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",  # Biological Process
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+cat("\nGO Enrichment Results (All DEGs):\n")
+cat("  - Enriched terms:", nrow(ego_all@result), "\n")
+
+if (nrow(ego_all@result) > 0) {
+  # Display top 10 enriched terms
+  cat("\nTop 10 Enriched GO Terms:\n")
+  print(head(ego_all@result[, c("Description", "GeneRatio", "pvalue", "qvalue")], 10))
+  
+  # Dotplot
+  print(dotplot(ego_all, showCategory = 20, title = "GO Enrichment - All DEGs"))
+  
+  # Barplot
+  print(barplot(ego_all, showCategory = 15, title = "Top GO Terms - All DEGs"))
+}
+```
+
+## 6.3 GO Enrichment - Upregulated Genes
+
+```{r go_enrichment_up}
+# GO enrichment for upregulated genes
+ego_up <- enrichGO(
+  gene = sig_up,
+  universe = background,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+cat("\nGO Enrichment Results (Upregulated):\n")
+cat("  - Enriched terms:", nrow(ego_up@result), "\n")
+
+if (nrow(ego_up@result) > 0) {
+  # Display top 10 enriched terms
+  cat("\nTop 10 Enriched GO Terms (Upregulated):\n")
+  print(head(ego_up@result[, c("Description", "GeneRatio", "pvalue", "qvalue")], 10))
+  
+  # Dotplot
+  print(dotplot(ego_up, showCategory = 20, title = "GO Enrichment - Upregulated Genes"))
+  
+  # Barplot
+  print(barplot(ego_up, showCategory = 15, title = "Top GO Terms - Upregulated"))
+}
+```
+
+## 6.4 GO Enrichment - Downregulated Genes
+
+```{r go_enrichment_down}
+# GO enrichment for downregulated genes
+ego_down <- enrichGO(
+  gene = sig_down,
+  universe = background,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+cat("\nGO Enrichment Results (Downregulated):\n")
+cat("  - Enriched terms:", nrow(ego_down@result), "\n")
+
+if (nrow(ego_down@result) > 0) {
+  # Display top 10 enriched terms
+  cat("\nTop 10 Enriched GO Terms (Downregulated):\n")
+  print(head(ego_down@result[, c("Description", "GeneRatio", "pvalue", "qvalue")], 10))
+  
+  # Dotplot
+  print(dotplot(ego_down, showCategory = 20, title = "GO Enrichment - Downregulated Genes"))
+  
+  # Barplot
+  print(barplot(ego_down, showCategory = 15, title = "Top GO Terms - Downregulated"))
+}
+```
+
+## 6.5 Compare Enrichment Between Up and Down
+
+```{r compare_enrichment}
+if (nrow(ego_up@result) > 0 && nrow(ego_down@result) > 0) {
+  # Create comparison list
+  gene_list <- list(
+    Upregulated = sig_up,
+    Downregulated = sig_down
+  )
+  
+  # Compare GO enrichment
+  compare_go <- compareCluster(
+    geneCluster = gene_list,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2
+  )
+  
+  # Dotplot comparison
+  print(dotplot(compare_go, showCategory = 10, 
+                title = "GO Enrichment Comparison: Up vs Down"))
+}
+```
+
+*Interpretation:* GO enrichment analysis reveals the biological processes most affected by differential expression. Upregulated genes may be enriched in cell proliferation, DNA replication, and metabolic pathways associated with cancer. Downregulated genes may be enriched in differentiation, immune response, or tumor suppressor pathways.
+
+# 7. Extended Results Analysis
+
+## 7.1 Distribution of Differentially Expressed Genes
 
 ```{r deg_distribution}
 # Detailed breakdown of DEG categories
 cat("=== DIFFERENTIAL EXPRESSION BREAKDOWN ===\n\n")
 
 # Overall statistics
-total_tested <- sum(!is.na(res_df$padj))
-total_sig <- sum(res_df$padj < 0.05, na.rm = TRUE)
+total_tested <- nrow(res_df)
+total_sig <- sum(res_df$FDR < 0.05, na.rm = TRUE)
 total_sig_fc <- sum(res_df$significance == "Significant", na.rm = TRUE)
 
 cat("Total genes tested:", total_tested, "\n")
-cat("Significant genes (padj < 0.05):", total_sig, 
+cat("Significant genes (FDR < 0.05):", total_sig, 
     sprintf("(%.1f%%)", 100 * total_sig / total_tested), "\n")
-cat("Significant with |log2FC| >= 1:", total_sig_fc, 
+cat("Significant with |logFC| >= 1:", total_sig_fc, 
     sprintf("(%.1f%%)", 100 * total_sig_fc / total_tested), "\n\n")
 
 # Direction breakdown
@@ -400,23 +616,23 @@ cat(sprintf("Upregulated: %d (%.1f%%)\n", up_genes, 100 * up_genes / (up_genes +
 cat(sprintf("Downregulated: %d (%.1f%%)\n", down_genes, 100 * down_genes / (up_genes + down_genes)))
 ```
 
-## 6.2 Fold Change Distribution
+## 7.2 Fold Change Distribution
 
 ```{r fc_distribution}
 # Distribution of log2 fold changes for significant genes
 sig_genes <- res_df %>% filter(significance == "Significant")
 
 cat("\n=== LOG2 FOLD CHANGE STATISTICS (Significant DEGs) ===\n")
-print(summary(sig_genes$log2FoldChange))
+print(summary(sig_genes$logFC))
 
 # Visualize fold change distribution
-ggplot(sig_genes, aes(x = log2FoldChange, fill = direction)) +
+ggplot(sig_genes, aes(x = logFC, fill = direction)) +
   geom_histogram(bins = 50, alpha = 0.7, color = "black") +
   scale_fill_manual(values = c("Upregulated" = "red3", "Downregulated" = "blue3")) +
-  geom_vline(xintercept = c(-1, 1), linetype = "dashed", size = 1) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", linewidth = 1) +
   labs(
     title = "Distribution of Log2 Fold Changes",
-    subtitle = "Significant DEGs (padj < 0.05, |log2FC| >= 1)",
+    subtitle = "Significant DEGs (FDR < 0.05, |logFC| >= 1)",
     x = "Log2 Fold Change",
     y = "Number of Genes",
     fill = "Direction"
@@ -428,149 +644,11 @@ ggplot(sig_genes, aes(x = log2FoldChange, fill = direction)) +
 
 *Interpretation:* The distribution shows whether upregulated and downregulated genes have similar magnitude changes. A symmetric distribution suggests balanced regulation, while asymmetry might indicate preferential activation or repression of certain pathways.
 
-## 6.3 Top Differentially Expressed Genes
-
-```{r top_degs_analysis}
-# Top 20 upregulated genes
-cat("\n=== TOP 20 UPREGULATED GENES IN TUMORS ===\n")
-top20_up <- res_df %>%
-  filter(direction == "Upregulated") %>%
-  arrange(desc(log2FoldChange)) %>%
-  head(20) %>%
-  mutate(
-    log2FC = round(log2FoldChange, 2),
-    padj_sci = format(padj, scientific = TRUE, digits = 3)
-  ) %>%
-  dplyr::select(gene_id, log2FC, padj_sci, baseMean)
-
-print(top20_up)
-
-# Top 20 downregulated genes
-cat("\n=== TOP 20 DOWNREGULATED GENES IN TUMORS ===\n")
-top20_down <- res_df %>%
-  filter(direction == "Downregulated") %>%
-  arrange(log2FoldChange) %>%
-  head(20) %>%
-  mutate(
-    log2FC = round(log2FoldChange, 2),
-    padj_sci = format(padj, scientific = TRUE, digits = 3)
-  ) %>%
-  dplyr::select(gene_id, log2FC, padj_sci, baseMean)
-
-print(top20_down)
-```
-
-## 6.4 Most Statistically Significant Genes
-
-```{r most_significant}
-# Genes with lowest adjusted p-values
-cat("\n=== TOP 20 MOST STATISTICALLY SIGNIFICANT GENES ===\n")
-top20_sig <- res_df %>%
-  filter(!is.na(padj)) %>%
-  arrange(padj) %>%
-  head(20) %>%
-  mutate(
-    log2FC = round(log2FoldChange, 2),
-    padj_sci = format(padj, scientific = TRUE, digits = 3)
-  ) %>%
-  dplyr::select(gene_id, log2FC, padj_sci, direction, baseMean)
-
-print(top20_sig)
-```
-
-## 6.5 Expression Level Analysis
-
-```{r expression_levels}
-# Relationship between expression level and differential expression
-res_df_plot <- res_df %>%
-  filter(!is.na(padj)) %>%
-  mutate(
-    expression_level = cut(baseMean, 
-                          breaks = c(0, 10, 100, 1000, 10000, Inf),
-                          labels = c("Very Low", "Low", "Medium", "High", "Very High"))
-  )
-
-# Count significant genes by expression level
-sig_by_expr <- res_df_plot %>%
-  group_by(expression_level) %>%
-  summarise(
-    total = n(),
-    significant = sum(significance == "Significant"),
-    percent_sig = round(100 * significant / total, 1)
-  )
-
-cat("\n=== DIFFERENTIAL EXPRESSION BY EXPRESSION LEVEL ===\n")
-print(sig_by_expr)
-
-# Visualize
-ggplot(sig_by_expr, aes(x = expression_level, y = percent_sig, fill = expression_level)) +
-  geom_bar(stat = "identity", color = "black") +
-  geom_text(aes(label = paste0(percent_sig, "%")), vjust = -0.5, size = 4) +
-  scale_fill_brewer(palette = "YlOrRd") +
-  labs(
-    title = "Proportion of Significant DEGs by Expression Level",
-    x = "Expression Level (baseMean)",
-    y = "% Significantly Differentially Expressed",
-    fill = "Expression Level"
-  ) +
-  theme_bw() +
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold"),
-    legend.position = "none"
-  ) +
-  ylim(0, max(sig_by_expr$percent_sig) * 1.1)
-```
-
-*Interpretation:* This analysis shows whether highly expressed genes or lowly expressed genes are more likely to be differentially expressed. Higher expression genes typically have more statistical power, but biological regulation can occur at any expression level.
-
-## 6.6 Effect Size Analysis
-
-```{r effect_size}
-# Categorize genes by effect size
-res_df_effect <- res_df %>%
-  filter(significance == "Significant") %>%
-  mutate(
-    effect_size = case_when(
-      abs(log2FoldChange) >= 3 ~ "Very Large (|log2FC| >= 3)",
-      abs(log2FoldChange) >= 2 ~ "Large (2-3)",
-      abs(log2FoldChange) >= 1 ~ "Moderate (1-2)",
-      TRUE ~ "Small"
-    ),
-    effect_size = factor(effect_size, levels = c("Moderate (1-2)", "Large (2-3)", "Very Large (|log2FC| >= 3)"))
-  )
-
-# Count by effect size and direction
-effect_summary <- res_df_effect %>%
-  group_by(effect_size, direction) %>%
-  summarise(count = n(), .groups = "drop")
-
-cat("\n=== EFFECT SIZE DISTRIBUTION ===\n")
-print(effect_summary)
-
-# Visualize
-ggplot(effect_summary, aes(x = effect_size, y = count, fill = direction)) +
-  geom_bar(stat = "identity", position = "dodge", color = "black") +
-  scale_fill_manual(values = c("Upregulated" = "red3", "Downregulated" = "blue3")) +
-  labs(
-    title = "Distribution of Effect Sizes Among DEGs",
-    x = "Effect Size Category",
-    y = "Number of Genes",
-    fill = "Direction"
-  ) +
-  theme_bw() +
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold"),
-    axis.text.x = element_text(angle = 0, hjust = 0.5)
-  )
-```
-
-*Interpretation:* Effect size indicates the magnitude of change. Very large fold changes (|log2FC| >= 3 means 8-fold change) may represent key driver genes or highly dysregulated pathways, while moderate changes may reflect subtle regulatory adjustments.
-
-## 6.7 P-value Distribution
+## 7.3 P-value Distribution
 
 ```{r pvalue_distribution}
 # Check p-value distribution (quality control)
-ggplot(res_df %>% filter(!is.na(pvalue)), aes(x = pvalue)) +
+ggplot(res_df %>% filter(!is.na(PValue)), aes(x = PValue)) +
   geom_histogram(bins = 50, fill = "steelblue", color = "black", alpha = 0.7) +
   labs(
     title = "Distribution of Raw P-values",
@@ -587,36 +665,9 @@ ggplot(res_df %>% filter(!is.na(pvalue)), aes(x = pvalue)) +
 
 *Interpretation:* A proper p-value distribution should be relatively uniform across most values (representing null hypotheses) with an enrichment of small p-values near 0 (representing true positives). This pattern confirms our differential expression analysis is working correctly.
 
-## 6.8 Comparison of Metrics
+# 8. Biological Interpretation Summary
 
-```{r metric_comparison}
-# Scatter plot: log2FC vs -log10(padj) colored by expression
-sig_for_plot <- res_df %>%
-  filter(significance == "Significant") %>%
-  mutate(log_expr = log10(baseMean + 1))
-
-ggplot(sig_for_plot, aes(x = abs(log2FoldChange), y = -log10(padj), color = log_expr)) +
-  geom_point(alpha = 0.6, size = 2) +
-  scale_color_viridis_c(option = "plasma") +
-  labs(
-    title = "Relationship Between Effect Size and Statistical Significance",
-    subtitle = "Significant DEGs only",
-    x = "Absolute Log2 Fold Change",
-    y = "-Log10(Adjusted P-value)",
-    color = "Log10(Expression)"
-  ) +
-  theme_bw() +
-  theme(
-    plot.title = element_text(hjust = 0.5, face = "bold"),
-    plot.subtitle = element_text(hjust = 0.5)
-  )
-```
-
-*Interpretation:* This plot shows that genes with higher expression levels (brighter colors) tend to achieve greater statistical significance for the same fold change, due to lower measurement variability. This is expected and demonstrates proper statistical behavior.
-
-# 7. Biological Interpretation Summary
-
-## 7.1 Key Quantitative Findings
+## 8.1 Key Quantitative Findings
 
 ```{r final_summary}
 cat("\n")
@@ -625,12 +676,12 @@ cat("    FINAL ANALYSIS SUMMARY\n")
 cat("========================================\n\n")
 
 cat("DATASET:\n")
-cat("  - Total genes analyzed:", nrow(res_df %>% filter(!is.na(padj))), "\n")
+cat("  - Total genes analyzed:", nrow(res_df), "\n")
 cat("  - Samples: Tumor (", sum(coldata_sub$condition == "tumor"), 
     ") vs Normal (", sum(coldata_sub$condition == "normal"), ")\n\n")
 
-cat("DIFFERENTIAL EXPRESSION RESULTS:\n")
-cat("  - Significant DEGs (padj < 0.05, |log2FC| >= 1):", 
+cat("DIFFERENTIAL EXPRESSION RESULTS (edgeR):\n")
+cat("  - Significant DEGs (FDR < 0.05, |logFC| >= 1):", 
     sum(res_df$significance == "Significant", na.rm = TRUE), "\n")
 cat("  - Upregulated in tumor:", 
     sum(res_df$direction == "Upregulated", na.rm = TRUE), "\n")
@@ -641,15 +692,15 @@ cat("EFFECT SIZES:\n")
 effect_stats <- res_df %>% 
   filter(significance == "Significant") %>%
   summarise(
-    min_fc = min(log2FoldChange),
-    max_fc = max(log2FoldChange),
-    median_fc = median(log2FoldChange)
+    min_fc = min(logFC),
+    max_fc = max(logFC),
+    median_fc = median(logFC)
   )
-cat("  - Largest upregulation: log2FC =", round(effect_stats$max_fc, 2), 
+cat("  - Largest upregulation: logFC =", round(effect_stats$max_fc, 2), 
     sprintf("(%.1f-fold)", 2^effect_stats$max_fc), "\n")
-cat("  - Largest downregulation: log2FC =", round(effect_stats$min_fc, 2),
+cat("  - Largest downregulation: logFC =", round(effect_stats$min_fc, 2),
     sprintf("(%.1f-fold)", 2^effect_stats$min_fc), "\n")
-cat("  - Median absolute log2FC:", round(median(abs(sig_genes$log2FoldChange)), 2), "\n\n")
+cat("  - Median absolute logFC:", round(median(abs(sig_genes$logFC)), 2), "\n\n")
 
 cat("BIOLOGICAL SIGNIFICANCE:\n")
 cat("  - ", round(100 * sum(res_df$significance == "Significant", na.rm = TRUE) / total_tested, 1),
@@ -660,56 +711,11 @@ cat("  - Consistent with hallmarks of cancer (proliferation, evasion, metabolism
 cat("========================================\n")
 ```
 
-## 7.2 Biological Context
+## 8.2 Biological Context
 
-The extensive differential expression observed (>16,000 genes) reflects the complex molecular changes during lung adenocarcinoma development:
+The extensive differential expression observed reflects the complex molecular changes during lung adenocarcinoma development:
 
-*Expected Biological Processes Affected:*
+**Expected Biological Processes Affected:**
 
-1.⁠ ⁠*Cell Cycle & Proliferation*: Upregulated genes likely include cyclins, CDKs, and DNA replication machinery
-2.⁠ ⁠*Apoptosis Evasion*: Downregulation of pro-apoptotic genes, upregulation of anti-apoptotic factors
-3.⁠ ⁠*Metabolic Reprogramming*: Enhanced glycolysis (Warburg effect) and altered mitochondrial function
-4.⁠ ⁠*Immune Evasion*: Changes in immune checkpoint genes and antigen presentation
-5.⁠ ⁠*ECM Remodeling*: Matrix metalloproteinases and adhesion molecules for invasion/metastasis
-6.⁠ ⁠*Angiogenesis*: VEGF and related factors to support tumor vasculature
-
-*Clinical Relevance:*
-
-•⁠  ⁠Identified DEGs may include known therapeutic targets (e.g., EGFR, ALK)
-•⁠  ⁠Novel biomarkers for diagnosis, prognosis, or treatment selection
-•⁠  ⁠Basis for understanding resistance mechanisms
-
-# 8. Conclusions
-
-## Key Findings:
-
-1. **Massive Transcriptional Changes**: We identified 16,342 significantly differentially expressed genes (28% of tested genes) between tumor and normal lung tissue, indicating substantial molecular reprogramming during tumorigenesis.
-
-2. **Clear Tissue Separation**: PCA and hierarchical clustering show that tumor and normal samples form distinct groups based on gene expression, validating the quality of our analysis.
-
-3. **Balanced Regulation**: Both upregulated and downregulated genes are present, suggesting coordinated activation of oncogenic programs and silencing of tumor suppressors.
-
-4. **Range of Effect Sizes**: Fold changes span from moderate (2-fold) to extreme (>100-fold), indicating both subtle regulatory changes and dramatic pathway disruptions.
-
-5. **Methodological Strengths**:
-   - Used established TCGA data (standardized, high-quality)
-   - Applied DESeq2 (gold standard for RNA-seq differential expression)
-   - Multiple testing correction (FDR control via Benjamini-Hochberg)
-   - Stringent thresholds (padj < 0.05 and |log2FC| ≥ 1)
-
-## Study Limitations:
-
-- Bulk RNA-seq cannot distinguish cell-type specific changes
-- Cross-sectional design limits causal inference
-- Need validation in independent cohorts
-- Functional validation required to confirm biological relevance
-
-## Future Directions:
-
-- **Pathway Enrichment Analysis**: Identify enriched biological processes and pathways
-- **Gene Set Analysis**: Test for coordinated changes in cancer-related gene sets
-- **Clinical Correlation**: Relate DEGs to patient outcomes and tumor stage
-- **Validation**: qRT-PCR or independent datasets
-- **Functional Studies**: Experimental validation of key candidates
-
----
+1.  **Cell Cycle & Proliferation**: Upregulated genes likely include cyclins, CDKs, and DNA replication machinery
+2.  **Apoptosis Evasion**: Downregulation of pro-ap
